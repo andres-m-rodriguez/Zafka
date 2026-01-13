@@ -18,11 +18,11 @@ pub fn main() !void {
 
     const conn = try listener.accept();
     defer conn.stream.close();
-
-    var reader_buffer: [4092]u8 = undefined;
-    var stream_reader = conn.stream.reader(&reader_buffer);
-    try brokerRequest.parseRequest(&stream_reader.interface_state); //Later on this will return the parsed request...maybe??
-
+    //
+    // var reader_buffer: [4092]u8 = undefined;
+    // var stream_reader = conn.stream.reader(&reader_buffer);
+    // try brokerRequest.parseRequest(&stream_reader.interface_state); //Later on this will return the parsed request...maybe??
+    //
     var stream_buffer: [4092]u8 = undefined;
     const stream_writer = conn.stream.writer(&stream_buffer);
     var stream_writer_i = stream_writer.interface;
