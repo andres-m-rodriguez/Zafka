@@ -7,11 +7,11 @@ pub fn main() !void {
     std.debug.print("Logs from your program will appear here!\n", .{});
 
     // TODO: Uncomment the code below to pass the first stage
-    // const address = try net.Address.resolveIp("127.0.0.1", 9092);
-    // var listener = try address.listen(.{
-    //     .reuse_address = true,
-    // });
-    // defer listener.deinit();
-    //
-    // _ = try listener.accept();
+    const address = try net.Address.resolveIp("127.0.0.1", 9092);
+    var listener = try address.listen(.{
+        .reuse_address = true,
+    });
+    defer listener.deinit();
+
+    _ = try listener.accept();
 }
