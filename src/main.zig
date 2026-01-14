@@ -23,10 +23,8 @@ pub fn main() !void {
     var stream_reader = conn.stream.reader(&reader_buffer);
     const stream_reader_i = stream_reader.interface();
     const parsed_request = try brokerRequest.parseRequest(arena.allocator(), stream_reader_i);
-    std.debug.print("Message size: {d}\n correlationId: {d}", .{parsed_request.message_size, parsed_request.headers.correlation_id});
-
-
-    
+    std.debug.print("Message size: {d}\n correlationId: {d}", .{ parsed_request.message_size, parsed_request.headers.correlation_id });
+    //Comment to trigger push
     var stream_buffer: [4092]u8 = undefined;
     var stream_writer = conn.stream.writer(&stream_buffer);
     try brokerResponse.writeResponse(&stream_writer.interface, parsed_request);
