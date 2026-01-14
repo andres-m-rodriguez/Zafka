@@ -1,15 +1,28 @@
 const std = @import("std");
-const brokerHeader = @import("BrokerHeader.zig");
 
+
+
+pub const RequestHeader = struct {
+    api_key: u16,
+    api_version: u16,
+    correlation_id: i32,
+    client_id: ?[]const u8,
+};
 pub const BrokerRequest = struct {
     message_size: i32,
-    headers: brokerHeader.BrokerHeader,
+    headers: RequestHeader,
 };
 
 const ParsingState = struct {
     state: State = .Parsing_api_key,
 
-    const State = enum { Parsing_api_key, Parsing_api_version, Parsing_correlation_id, Parsing_client_id, Done };
+    const State = enum {
+        Parsing_api_key,
+        Parsing_api_version,
+        Parsing_correlation_id,
+        Parsing_client_id,
+        Done,
+    };
 
     pub fn next(self: *ParsingState) void {
         switch (self.state) {
@@ -32,9 +45,9 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
     const message_size = std.mem.readInt(i32, message_size_bytes[0..4], .big);
     var brokerRequest = BrokerRequest{
         .message_size = message_size,
-        .headers = brokerHeader.BrokerHeader{
-            .request_api_key = 0,
-            .request_api_version = 0,
+        .headers = RequestHeader{
+            .api_key = 0,
+            .api_version = 0,
             .correlation_id = 0,
             .client_id = null,
         },
@@ -60,9 +73,8 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                         consumed += parsing_results.complete.bytes_consumed;
                         const bytes = parsing_results.complete.value;
                         const ptr: *const [2]u8 = @ptrCast(bytes.ptr);
-                        brokerRequest.headers.request_api_key = std.mem.readInt(u16, ptr, .big);
+                        brokerRequest.headers.api_key = std.mem.readInt(u16, ptr, .big);
                         parsing_state.next();
-
                     }
                 },
                 .Parsing_api_version => {
@@ -71,7 +83,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                         consumed += parsing_results.complete.bytes_consumed;
                         const bytes = parsing_results.complete.value;
                         const ptr: *const [2]u8 = @ptrCast(bytes.ptr);
-                        brokerRequest.headers.request_api_version = std.mem.readInt(u16, ptr, .big);
+                        brokerRequest.headers.api_version = std.mem.readInt(u16, ptr, .big);
                         parsing_state.next();
                     }
                 },
