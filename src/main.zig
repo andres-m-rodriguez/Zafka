@@ -27,5 +27,5 @@ pub fn main() !void {
     //Comment to trigger push
     var stream_buffer: [4092]u8 = undefined;
     var stream_writer = conn.stream.writer(&stream_buffer);
-    try brokerResponse.writeResponse(&stream_writer.interface, parsed_request);
+    try brokerResponse.writeResponse(arena.allocator(), &stream_writer.interface, parsed_request);
 }

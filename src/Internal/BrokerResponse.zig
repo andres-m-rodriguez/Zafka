@@ -17,10 +17,26 @@ pub const ApiVersionsResponse = struct {
     throttle_time_ms: i32,
 };
 
+pub const TopicResponse = struct {
+    error_code: i16,
+    name: []const u8,
+    topic_id: [16]u8, // UUID as 16 bytes
+    is_internal: bool,
+    // partitions array - empty for unknown topic
+    topic_authorized_operations: i32,
+};
+
+pub const DescribeTopicPartitionsResponse = struct {
+    throttle_time_ms: i32,
+    topics: []const TopicResponse,
+    // next_cursor: nullable, use -1 for null
+};
+
 pub const BrokerResponse = struct {
     header: ResponseHeader,
     body: union(enum) {
         api_versions: ApiVersionsResponse,
+        describe_topic_partitions: DescribeTopicPartitionsResponse,
     },
 };
 
@@ -37,30 +53,87 @@ const supported_api_keys = [_]ApiKeyEntry{
     },
 };
 
-fn createResponse(request: brokerRequest.BrokerRequest) BrokerResponse {
-    const error_code: i16 = switch (request.headers.api_version) {
-        0...4 => 0,
-        else => 35,
+fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerRequest) !BrokerResponse {
+    const header = ResponseHeader{
+        .correlation_id = request.headers.correlation_id,
     };
 
-    const api_versions_body = ApiVersionsResponse{
-        .error_code = error_code,
-        .api_keys = &supported_api_keys,
-        .throttle_time_ms = 0,
-    };
+    switch (request.headers.api_key) {
+        18 => {
+            // ApiVersions
+            const error_code: i16 = switch (request.headers.api_version) {
+                0...4 => 0,
+                else => 35,
+            };
 
-    return BrokerResponse{
-        .header = ResponseHeader{
-            .correlation_id = request.headers.correlation_id,
+            return BrokerResponse{
+                .header = header,
+                .body = .{
+                    .api_versions = ApiVersionsResponse{
+                        .error_code = error_code,
+                        .api_keys = &supported_api_keys,
+                        .throttle_time_ms = 0,
+                    },
+                },
+            };
         },
-        .body = .{ .api_versions = api_versions_body, },
-    };
+        75 => {
+            // DescribeTopicPartitions
+            const body = request.body;
+            var topic_responses: []TopicResponse = &[_]TopicResponse{};
+
+            if (body == .describe_topic_partitions) {
+                const topic_names = body.describe_topic_partitions.topic_names;
+                var responses = try allocator.alloc(TopicResponse, topic_names.len);
+
+                for (topic_names, 0..) |name, i| {
+                    responses[i] = TopicResponse{
+                        .error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
+                        .name = name,
+                        .topic_id = [_]u8{0} ** 16, // All zeros UUID
+                        .is_internal = false,
+                        .topic_authorized_operations = 0,
+                    };
+                }
+                topic_responses = responses;
+            }
+
+            return BrokerResponse{
+                .header = header,
+                .body = .{
+                    .describe_topic_partitions = DescribeTopicPartitionsResponse{
+                        .throttle_time_ms = 0,
+                        .topics = topic_responses,
+                    },
+                },
+            };
+        },
+        else => {
+            // Default to ApiVersions with error
+            return BrokerResponse{
+                .header = header,
+                .body = .{
+                    .api_versions = ApiVersionsResponse{
+                        .error_code = 35, // UNSUPPORTED_VERSION
+                        .api_keys = &supported_api_keys,
+                        .throttle_time_ms = 0,
+                    },
+                },
+            };
+        },
+    }
 }
-fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
+fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1: bool) !void {
     var buf: [256]u8 = undefined;
     var fbs = std.Io.Writer.fixed(&buf);
 
+    // Write correlation_id
     try fbs.writeInt(i32, response.header.correlation_id, .big);
+
+    // Header v1 includes TAG_BUFFER after correlation_id
+    if (use_header_v1) {
+        try fbs.writeByte(0); // TAG_BUFFER (empty)
+    }
 
     switch (response.body) {
         .api_versions => |av| {
@@ -77,6 +150,43 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
             try fbs.writeInt(i32, av.throttle_time_ms, .big);
             try fbs.writeByte(0);
         },
+        .describe_topic_partitions => |dtp| {
+            // throttle_time_ms (INT32)
+            try fbs.writeInt(i32, dtp.throttle_time_ms, .big);
+
+            // topics array (COMPACT_ARRAY: length + 1)
+            try fbs.writeByte(@intCast(dtp.topics.len + 1));
+
+            for (dtp.topics) |topic| {
+                // error_code (INT16)
+                try fbs.writeInt(i16, topic.error_code, .big);
+
+                // topic_name (COMPACT_STRING: length + 1, then bytes)
+                try fbs.writeByte(@intCast(topic.name.len + 1));
+                try fbs.writeAll(topic.name);
+
+                // topic_id (UUID: 16 bytes)
+                try fbs.writeAll(&topic.topic_id);
+
+                // is_internal (BOOLEAN: 1 byte)
+                try fbs.writeByte(if (topic.is_internal) 1 else 0);
+
+                // partitions array (COMPACT_ARRAY: empty = 1)
+                try fbs.writeByte(1); // 0 elements
+
+                // topic_authorized_operations (INT32)
+                try fbs.writeInt(i32, topic.topic_authorized_operations, .big);
+
+                // TAG_BUFFER for this topic
+                try fbs.writeByte(0);
+            }
+
+            // next_cursor (NULLABLE: -1 means null, encoded as single byte 0xff)
+            try fbs.writeByte(0xff);
+
+            // TAG_BUFFER for response body
+            try fbs.writeByte(0);
+        },
     }
 
     const written = fbs.buffered();
@@ -85,7 +195,9 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
-pub fn writeResponse(writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
-    const response = createResponse(request);
-    try write(&response, writer);
+pub fn writeResponse(allocator: std.mem.Allocator, writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
+    const response = try createResponse(allocator, request);
+    // Use header v1 for DescribeTopicPartitions (api_key 75)
+    const use_header_v1 = request.headers.api_key == 75;
+    try write(&response, writer, use_header_v1);
 }
