@@ -34,7 +34,7 @@ const supported_api_keys = [_]ApiKeyEntry{
 };
 
 fn createResponse(request: brokerRequest.BrokerRequest) BrokerResponse {
-    const error_code: i16 = switch (request.headers.request_api_version) {
+    const error_code: i16 = switch (request.headers.api_version) {
         0...4 => 0,
         else => 35,
     };
