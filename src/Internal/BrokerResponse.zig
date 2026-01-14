@@ -81,7 +81,7 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
     try writer.flush();
 }
 
-pub fn writeResponse(request: brokerRequest.BrokerRequest, writer: *std.Io.Writer) !void {
+pub fn writeResponse(writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
     const response = createResponse(request);
     try write(&response, writer);
 }
