@@ -7,7 +7,7 @@ pub const BrokerHeader = struct {
     client_id: ?[]const u8,
 
     pub fn deinit(self: *BrokerHeader, allocator: std.mem.Allocator) void {
-        if (self.client_id) |id| {
+        if (self.client_id)  {
             allocator.free(self.client_id);
         }
     }
