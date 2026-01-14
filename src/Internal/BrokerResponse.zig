@@ -57,7 +57,7 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
     var fbs = std.Io.Writer.fixed(&buf);
 
     try fbs.writeInt(i32, response.header.correlation_id, .big);
-    try fbs.writeByte(0);
+
     switch (response.body) {
         .api_versions => |av| {
             try fbs.writeInt(i16, av.error_code, .big);
