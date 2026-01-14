@@ -24,23 +24,24 @@ pub const BrokerResponse = struct {
     },
 };
 
+
+const supported_api_keys = [_]ApiKeyEntry{
+    ApiKeyEntry{
+        .api_key = 18,
+        .min_version = 0,
+        .max_version = 4,
+    },
+};
+
 fn createResponse(request: brokerRequest.BrokerRequest) BrokerResponse {
-    const error_code: i16 = switch (request.headers.api_version) {
+    const error_code: i16 = switch (request.headers.request_api_version) {
         0...4 => 0,
         else => 35,
     };
 
-    const api_keys = [_]ApiKeyEntry{
-        ApiKeyEntry{
-            .api_key = 18,
-            .min_version = 0,
-            .max_version = 4,
-        },
-    };
-
     const api_versions_body = ApiVersionsResponse{
         .error_code = error_code,
-        .api_keys = &api_keys,
+        .api_keys = &supported_api_keys,
         .throttle_time_ms = 0,
     };
 
@@ -51,14 +52,12 @@ fn createResponse(request: brokerRequest.BrokerRequest) BrokerResponse {
         .body = .{ .api_versions = api_versions_body },
     };
 }
-
 fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
     var buf: [256]u8 = undefined;
     var fbs = std.Io.Writer.fixed(&buf);
 
     try fbs.writeInt(i32, response.header.correlation_id, .big);
-    try fbs.writeByte(0); 
-
+    try fbs.writeByte(0);
     switch (response.body) {
         .api_versions => |av| {
             try fbs.writeInt(i16, av.error_code, .big);
@@ -79,11 +78,10 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
     const written = fbs.buffered();
     try writer.writeInt(i32, @intCast(written.len), .big);
     try writer.writeAll(written);
-    try writer.flush(); 
+    try writer.flush();
 }
 
-pub fn writeResponse(writer: *std.Io.Writer,request: brokerRequest.BrokerRequest) !void {
-
+pub fn writeResponse(request: brokerRequest.BrokerRequest, writer: *std.Io.Writer) !void {
     const response = createResponse(request);
     try write(&response, writer);
 }
