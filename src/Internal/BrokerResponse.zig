@@ -30,6 +30,10 @@ const supported_api_keys = [_]ApiKeyEntry{
         .api_key = 18,
         .min_version = 0,
         .max_version = 4,
+    },ApiKeyEntry{
+        .api_key = 75,
+        .min_version = 0,
+        .max_version = 0,
     },
 };
 
@@ -49,7 +53,7 @@ fn createResponse(request: brokerRequest.BrokerRequest) BrokerResponse {
         .header = ResponseHeader{
             .correlation_id = request.headers.correlation_id,
         },
-        .body = .{ .api_versions = api_versions_body },
+        .body = .{ .api_versions = api_versions_body, },
     };
 }
 fn write(response: *const BrokerResponse, writer: *std.Io.Writer) !void {
