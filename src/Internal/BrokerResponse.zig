@@ -7,9 +7,16 @@ pub const BrokerResponse = struct {
 };
 
 pub fn writeResponse(writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
-    try writer.writeInt(i32, 0, std.builtin.Endian.big);
+    try writer.writeInt(i32, 0, .big);
 
-    try writer.writeInt(i32, request.headers.correlation_id, std.builtin.Endian.big);
+    try writer.writeInt(i32, request.headers.correlation_id, .big);
+
+    const error_code: i16 = switch (request.headers.request_api_version) {
+        0...4 => 0, // Valid versions
+        else => 35, // UNSUPPORTED_VERSION
+    };
+
+    try writer.writeInt(i16,error_code, .big);
 
     try writer.flush();
 }
