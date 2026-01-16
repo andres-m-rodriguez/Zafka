@@ -140,6 +140,14 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
                         };
                     }
                 }
+
+                // Sort topics alphabetically by name
+                std.mem.sort(TopicResponse, responses, {}, struct {
+                    fn lessThan(_: void, a: TopicResponse, b: TopicResponse) bool {
+                        return std.mem.order(u8, a.name, b.name) == .lt;
+                    }
+                }.lessThan);
+
                 topic_responses = responses;
             }
 
