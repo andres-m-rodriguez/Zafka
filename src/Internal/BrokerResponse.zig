@@ -53,11 +53,17 @@ pub const BrokerResponse = struct {
 
 const supported_api_keys = [_]ApiKeyEntry{
     ApiKeyEntry{
-        .api_key = 18,
+        .api_key = 1, // Fetch
+        .min_version = 0,
+        .max_version = 16,
+    },
+    ApiKeyEntry{
+        .api_key = 18, // ApiVersions
         .min_version = 0,
         .max_version = 4,
-    },ApiKeyEntry{
-        .api_key = 75,
+    },
+    ApiKeyEntry{
+        .api_key = 75, // DescribeTopicPartitions
         .min_version = 0,
         .max_version = 0,
     },
