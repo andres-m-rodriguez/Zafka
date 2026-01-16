@@ -13,9 +13,19 @@ pub const DescribeTopicPartitionsRequestBody = struct {
     topic_names: []const []const u8,
 };
 
+pub const FetchTopicRequest = struct {
+    topic_id: [16]u8,
+    partition_indexes: []const i32,
+};
+
+pub const FetchRequestBody = struct {
+    topics: []const FetchTopicRequest,
+};
+
 pub const RequestBody = union(enum) {
     none: void,
     describe_topic_partitions: DescribeTopicPartitionsRequestBody,
+    fetch: FetchRequestBody,
 };
 
 pub const BrokerRequest = struct {
@@ -42,6 +52,8 @@ const ParsingState = struct {
         Parsing_topic_name_length,
         Parsing_topic_name,
         Parsing_topic_tag_buffer,
+        // Body states for Fetch (api_key=1)
+        Parsing_fetch_body,
         // Terminal state
         Done,
     };
@@ -56,6 +68,8 @@ const ParsingState = struct {
                 // Transition to body parsing based on api_key
                 if (api_key == 75) {
                     self.state = .Parsing_topics_array_length;
+                } else if (api_key == 1) {
+                    self.state = .Parsing_fetch_body;
                 } else {
                     self.state = .Done;
                 }
@@ -71,6 +85,7 @@ const ParsingState = struct {
                     self.state = .Done;
                 }
             },
+            .Parsing_fetch_body => self.state = .Done,
             .Done => {},
         }
     }
@@ -98,6 +113,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
     // Body parsing state
     var topic_names: ?[][]u8 = null;
     var current_topic_name_len: usize = 0;
+    var fetch_topics: ?[]FetchTopicRequest = null;
 
     var buffer = std.ArrayList(u8){};
     errdefer buffer.deinit(allocator);
@@ -206,6 +222,67 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                     } else break;
                 },
 
+                // === BODY PARSING (Fetch) ===
+                .Parsing_fetch_body => {
+                    // Parse Fetch v16 request body
+                    // Skip: max_wait_ms(4) + min_bytes(4) + max_bytes(4) + isolation_level(1) + session_id(4) + session_epoch(4) = 21 bytes
+                    const remaining = buffer.items[consumed..];
+                    if (remaining.len < 22) break; // 21 + at least 1 for topics array length
+
+                    var pos: usize = 21; // Skip the fixed fields
+
+                    // Parse topics array (COMPACT_ARRAY)
+                    const topics_len_byte = remaining[pos];
+                    pos += 1;
+                    const topics_count: usize = if (topics_len_byte > 0) topics_len_byte - 1 else 0;
+
+                    if (topics_count > 0) {
+                        fetch_topics = try allocator.alloc(FetchTopicRequest, topics_count);
+
+                        for (0..topics_count) |topic_idx| {
+                            // topic_id: UUID (16 bytes)
+                            if (pos + 16 > remaining.len) break;
+                            var topic_id: [16]u8 = undefined;
+                            @memcpy(&topic_id, remaining[pos .. pos + 16]);
+                            pos += 16;
+
+                            // partitions: COMPACT_ARRAY
+                            if (pos >= remaining.len) break;
+                            const partitions_len_byte = remaining[pos];
+                            pos += 1;
+                            const partitions_count: usize = if (partitions_len_byte > 0) partitions_len_byte - 1 else 0;
+
+                            var partition_indexes = try allocator.alloc(i32, partitions_count);
+
+                            for (0..partitions_count) |part_idx| {
+                                // partition: INT32
+                                if (pos + 4 > remaining.len) break;
+                                partition_indexes[part_idx] = std.mem.readInt(i32, remaining[pos..][0..4], .big);
+                                pos += 4;
+
+                                // Skip: current_leader_epoch(4) + fetch_offset(8) + last_fetched_epoch(4) + log_start_offset(8) + partition_max_bytes(4) = 28 bytes
+                                pos += 28;
+
+                                // Skip partition TAG_BUFFER
+                                if (pos < remaining.len) pos += 1;
+                            }
+
+                            // Skip topic TAG_BUFFER
+                            if (pos < remaining.len) pos += 1;
+
+                            fetch_topics.?[topic_idx] = FetchTopicRequest{
+                                .topic_id = topic_id,
+                                .partition_indexes = partition_indexes,
+                            };
+                        }
+                    } else {
+                        fetch_topics = try allocator.alloc(FetchTopicRequest, 0);
+                    }
+
+                    consumed += pos;
+                    parsing_state.next(broker_request.headers.api_key);
+                },
+
                 .Done => break,
             }
         }
@@ -220,6 +297,15 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
         broker_request.body = .{
             .describe_topic_partitions = .{
                 .topic_names = names,
+            },
+        };
+    }
+
+    // Set the body if we parsed fetch topics
+    if (fetch_topics) |topics| {
+        broker_request.body = .{
+            .fetch = .{
+                .topics = topics,
             },
         };
     }

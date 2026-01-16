@@ -42,11 +42,21 @@ pub const DescribeTopicPartitionsResponse = struct {
     // next_cursor: nullable, use -1 for null
 };
 
+pub const FetchPartitionResponse = struct {
+    partition_index: i32,
+    error_code: i16,
+};
+
+pub const FetchTopicResponse = struct {
+    topic_id: [16]u8,
+    partitions: []const FetchPartitionResponse,
+};
+
 pub const FetchResponse = struct {
     throttle_time_ms: i32,
     error_code: i16,
     session_id: i32,
-    // responses array - empty for now
+    responses: []const FetchTopicResponse,
 };
 
 pub const BrokerResponse = struct {
@@ -85,6 +95,29 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
     switch (request.headers.api_key) {
         1 => {
             // Fetch
+            const body = request.body;
+            var fetch_responses: []FetchTopicResponse = &[_]FetchTopicResponse{};
+
+            if (body == .fetch) {
+                const topics = body.fetch.topics;
+                var responses = try allocator.alloc(FetchTopicResponse, topics.len);
+
+                for (topics, 0..) |topic, i| {
+                    // For unknown topics, return error code 100 (UNKNOWN_TOPIC_ID)
+                    var partition_responses = try allocator.alloc(FetchPartitionResponse, 1);
+                    partition_responses[0] = FetchPartitionResponse{
+                        .partition_index = 0,
+                        .error_code = 100, // UNKNOWN_TOPIC_ID
+                    };
+
+                    responses[i] = FetchTopicResponse{
+                        .topic_id = topic.topic_id,
+                        .partitions = partition_responses,
+                    };
+                }
+                fetch_responses = responses;
+            }
+
             return BrokerResponse{
                 .header = header,
                 .body = .{
@@ -92,6 +125,7 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
                         .throttle_time_ms = 0,
                         .error_code = 0,
                         .session_id = 0,
+                        .responses = fetch_responses,
                     },
                 },
             };
@@ -315,8 +349,48 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
             // session_id (INT32)
             try fbs.writeInt(i32, fetch.session_id, .big);
 
-            // responses array (COMPACT_ARRAY: 0 elements = 1)
-            try fbs.writeByte(1);
+            // responses array (COMPACT_ARRAY: length + 1)
+            try fbs.writeByte(@intCast(fetch.responses.len + 1));
+
+            for (fetch.responses) |topic_response| {
+                // topic_id (UUID: 16 bytes)
+                try fbs.writeAll(&topic_response.topic_id);
+
+                // partitions array (COMPACT_ARRAY: length + 1)
+                try fbs.writeByte(@intCast(topic_response.partitions.len + 1));
+
+                for (topic_response.partitions) |partition| {
+                    // partition_index (INT32)
+                    try fbs.writeInt(i32, partition.partition_index, .big);
+
+                    // error_code (INT16)
+                    try fbs.writeInt(i16, partition.error_code, .big);
+
+                    // high_watermark (INT64)
+                    try fbs.writeInt(i64, 0, .big);
+
+                    // last_stable_offset (INT64)
+                    try fbs.writeInt(i64, 0, .big);
+
+                    // log_start_offset (INT64)
+                    try fbs.writeInt(i64, 0, .big);
+
+                    // aborted_transactions (COMPACT_ARRAY: empty = 1)
+                    try fbs.writeByte(1);
+
+                    // preferred_read_replica (INT32)
+                    try fbs.writeInt(i32, 0, .big);
+
+                    // records (COMPACT_NULLABLE_BYTES: null = 0)
+                    try fbs.writeByte(0);
+
+                    // TAG_BUFFER for partition
+                    try fbs.writeByte(0);
+                }
+
+                // TAG_BUFFER for topic
+                try fbs.writeByte(0);
+            }
 
             // TAG_BUFFER
             try fbs.writeByte(0);
