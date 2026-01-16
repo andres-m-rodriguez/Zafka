@@ -42,11 +42,19 @@ pub const DescribeTopicPartitionsResponse = struct {
     // next_cursor: nullable, use -1 for null
 };
 
+pub const FetchResponse = struct {
+    throttle_time_ms: i32,
+    error_code: i16,
+    session_id: i32,
+    // responses array - empty for now
+};
+
 pub const BrokerResponse = struct {
     header: ResponseHeader,
     body: union(enum) {
         api_versions: ApiVersionsResponse,
         describe_topic_partitions: DescribeTopicPartitionsResponse,
+        fetch: FetchResponse,
     },
 };
 
@@ -75,6 +83,19 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
     };
 
     switch (request.headers.api_key) {
+        1 => {
+            // Fetch
+            return BrokerResponse{
+                .header = header,
+                .body = .{
+                    .fetch = FetchResponse{
+                        .throttle_time_ms = 0,
+                        .error_code = 0,
+                        .session_id = 0,
+                    },
+                },
+            };
+        },
         18 => {
             // ApiVersions
             const error_code: i16 = switch (request.headers.api_version) {
@@ -284,6 +305,22 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
             // TAG_BUFFER for response body
             try fbs.writeByte(0);
         },
+        .fetch => |fetch| {
+            // throttle_time_ms (INT32)
+            try fbs.writeInt(i32, fetch.throttle_time_ms, .big);
+
+            // error_code (INT16)
+            try fbs.writeInt(i16, fetch.error_code, .big);
+
+            // session_id (INT32)
+            try fbs.writeInt(i32, fetch.session_id, .big);
+
+            // responses array (COMPACT_ARRAY: 0 elements = 1)
+            try fbs.writeByte(1);
+
+            // TAG_BUFFER
+            try fbs.writeByte(0);
+        },
     }
 
     const written = fbs.buffered();
@@ -294,7 +331,7 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
 
 pub fn writeResponse(allocator: std.mem.Allocator, writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
     const response = try createResponse(allocator, request);
-    // Use header v1 for DescribeTopicPartitions (api_key 75)
-    const use_header_v1 = request.headers.api_key == 75;
+    // Use header v1 for flexible APIs (Fetch v12+, DescribeTopicPartitions)
+    const use_header_v1 = (request.headers.api_key == 1) or (request.headers.api_key == 75);
     try write(&response, writer, use_header_v1);
 }
