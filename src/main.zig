@@ -5,6 +5,7 @@ const brokerRequest = @import("Internal/BrokerRequest.zig");
 const brokerResponse = @import("Internal/BrokerResponse.zig");
 
 pub fn main() !void {
+    //Trigger test
     std.debug.print("Logs from your program will appear here!\n", .{});
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
