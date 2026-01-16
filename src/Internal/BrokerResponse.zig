@@ -1,5 +1,6 @@
 const std = @import("std");
 const brokerRequest = @import("BrokerRequest.zig");
+const clusterMetadata = @import("ClusterMetadata.zig");
 
 pub const ResponseHeader = struct {
     correlation_id: i32,
@@ -17,12 +18,21 @@ pub const ApiVersionsResponse = struct {
     throttle_time_ms: i32,
 };
 
+pub const PartitionResponse = struct {
+    error_code: i16,
+    partition_index: i32,
+    leader_id: i32,
+    leader_epoch: i32,
+    replica_nodes: []const i32,
+    isr_nodes: []const i32,
+};
+
 pub const TopicResponse = struct {
     error_code: i16,
     name: []const u8,
     topic_id: [16]u8, // UUID as 16 bytes
     is_internal: bool,
-    // partitions array - empty for unknown topic
+    partitions: []const PartitionResponse,
     topic_authorized_operations: i32,
 };
 
@@ -86,14 +96,49 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
                 const topic_names = body.describe_topic_partitions.topic_names;
                 var responses = try allocator.alloc(TopicResponse, topic_names.len);
 
+                // Load cluster metadata
+                const metadata = try clusterMetadata.parseClusterMetadata(
+                    allocator,
+                    "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log",
+                );
+
                 for (topic_names, 0..) |name, i| {
-                    responses[i] = TopicResponse{
-                        .error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
-                        .name = name,
-                        .topic_id = [_]u8{0} ** 16, // All zeros UUID
-                        .is_internal = false,
-                        .topic_authorized_operations = 0,
-                    };
+                    // Look up the topic in the cluster metadata
+                    if (metadata.findTopic(name)) |topic| {
+                        // Topic exists - build response with partition data
+                        const partition_metadata = try metadata.findPartitionsForTopic(allocator, topic.topic_id);
+                        var partition_responses = try allocator.alloc(PartitionResponse, partition_metadata.len);
+
+                        for (partition_metadata, 0..) |partition, j| {
+                            partition_responses[j] = PartitionResponse{
+                                .error_code = 0,
+                                .partition_index = partition.partition_index,
+                                .leader_id = partition.leader_id,
+                                .leader_epoch = partition.leader_epoch,
+                                .replica_nodes = partition.replica_nodes,
+                                .isr_nodes = partition.isr_nodes,
+                            };
+                        }
+
+                        responses[i] = TopicResponse{
+                            .error_code = 0, // No error
+                            .name = name,
+                            .topic_id = topic.topic_id,
+                            .is_internal = false,
+                            .partitions = partition_responses,
+                            .topic_authorized_operations = 0,
+                        };
+                    } else {
+                        // Topic does not exist
+                        responses[i] = TopicResponse{
+                            .error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
+                            .name = name,
+                            .topic_id = [_]u8{0} ** 16, // All zeros UUID
+                            .is_internal = false,
+                            .partitions = &[_]PartitionResponse{},
+                            .topic_authorized_operations = 0,
+                        };
+                    }
                 }
                 topic_responses = responses;
             }
@@ -124,7 +169,7 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
     }
 }
 fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1: bool) !void {
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var fbs = std.Io.Writer.fixed(&buf);
 
     // Write correlation_id
@@ -171,8 +216,46 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
                 // is_internal (BOOLEAN: 1 byte)
                 try fbs.writeByte(if (topic.is_internal) 1 else 0);
 
-                // partitions array (COMPACT_ARRAY: empty = 1)
-                try fbs.writeByte(1); // 0 elements
+                // partitions array (COMPACT_ARRAY: length + 1)
+                try fbs.writeByte(@intCast(topic.partitions.len + 1));
+
+                for (topic.partitions) |partition| {
+                    // error_code (INT16)
+                    try fbs.writeInt(i16, partition.error_code, .big);
+
+                    // partition_index (INT32)
+                    try fbs.writeInt(i32, partition.partition_index, .big);
+
+                    // leader_id (INT32)
+                    try fbs.writeInt(i32, partition.leader_id, .big);
+
+                    // leader_epoch (INT32)
+                    try fbs.writeInt(i32, partition.leader_epoch, .big);
+
+                    // replica_nodes (COMPACT_ARRAY of INT32)
+                    try fbs.writeByte(@intCast(partition.replica_nodes.len + 1));
+                    for (partition.replica_nodes) |replica| {
+                        try fbs.writeInt(i32, replica, .big);
+                    }
+
+                    // isr_nodes (COMPACT_ARRAY of INT32)
+                    try fbs.writeByte(@intCast(partition.isr_nodes.len + 1));
+                    for (partition.isr_nodes) |isr| {
+                        try fbs.writeInt(i32, isr, .big);
+                    }
+
+                    // eligible_leader_replicas (COMPACT_ARRAY: empty = 1)
+                    try fbs.writeByte(1); // 0 elements
+
+                    // last_known_elr (COMPACT_ARRAY: empty = 1)
+                    try fbs.writeByte(1); // 0 elements
+
+                    // offline_replicas (COMPACT_ARRAY: empty = 1)
+                    try fbs.writeByte(1); // 0 elements
+
+                    // TAG_BUFFER for this partition
+                    try fbs.writeByte(0);
+                }
 
                 // topic_authorized_operations (INT32)
                 try fbs.writeInt(i32, topic.topic_authorized_operations, .big);
