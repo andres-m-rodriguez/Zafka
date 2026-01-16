@@ -24,6 +24,7 @@ pub const FetchRequestBody = struct {
 
 pub const ProducePartitionRequest = struct {
     partition_index: i32,
+    records: ?[]const u8, // Raw record batch data
 };
 
 pub const ProduceTopicRequest = struct {
@@ -362,7 +363,8 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                                 const partition_index = std.mem.readInt(i32, remaining[pos..][0..4], .big);
                                 pos += 4;
 
-                                // records (COMPACT_BYTES) - skip
+                                // records (COMPACT_BYTES)
+                                var records: ?[]const u8 = null;
                                 if (pos >= remaining.len) break;
                                 // Read unsigned varint for records length
                                 var records_len: u64 = 0;
@@ -374,8 +376,14 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                                     if ((b & 0x80) == 0) break;
                                     shift += 7;
                                 }
-                                if (records_len > 0) {
-                                    pos += @intCast(records_len - 1); // -1 because COMPACT encoding
+                                if (records_len > 1) {
+                                    const actual_len: usize = @intCast(records_len - 1); // -1 because COMPACT encoding
+                                    if (pos + actual_len <= remaining.len) {
+                                        const records_data = try allocator.alloc(u8, actual_len);
+                                        @memcpy(records_data, remaining[pos .. pos + actual_len]);
+                                        records = records_data;
+                                        pos += actual_len;
+                                    }
                                 }
 
                                 // Skip partition TAG_BUFFER
@@ -383,6 +391,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
 
                                 partitions[part_idx] = ProducePartitionRequest{
                                     .partition_index = partition_index,
+                                    .records = records,
                                 };
                             }
 

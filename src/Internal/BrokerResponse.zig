@@ -112,6 +112,32 @@ const supported_api_keys = [_]ApiKeyEntry{
     },
 };
 
+fn writeRecordsToDisk(topic_name: []const u8, partition_index: i32, records: []const u8) void {
+    // Build log file path: /tmp/kraft-combined-logs/{topic_name}-{partition}/00000000000000000000.log
+    var path_buf: [256]u8 = undefined;
+    const log_path = std.fmt.bufPrint(&path_buf, "/tmp/kraft-combined-logs/{s}-{d}/00000000000000000000.log", .{ topic_name, partition_index }) catch return;
+
+    // Open or create the file and append the records
+    const file = std.fs.openFileAbsolute(log_path, .{ .mode = .write_only }) catch |err| {
+        if (err == error.FileNotFound) {
+            // Create directory and file
+            var dir_buf: [256]u8 = undefined;
+            const dir_path = std.fmt.bufPrint(&dir_buf, "/tmp/kraft-combined-logs/{s}-{d}", .{ topic_name, partition_index }) catch return;
+            std.fs.makeDirAbsolute(dir_path) catch {};
+            const new_file = std.fs.createFileAbsolute(log_path, .{}) catch return;
+            new_file.writeAll(records) catch {};
+            new_file.close();
+            return;
+        }
+        return;
+    };
+    defer file.close();
+
+    // Seek to end and append
+    file.seekFromEnd(0) catch {};
+    file.writeAll(records) catch {};
+}
+
 fn readLogFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
     const file = std.fs.openFileAbsolute(path, .{}) catch {
         return null;
@@ -169,7 +195,11 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
                             }
 
                             if (partition_exists) {
-                                // Valid topic and partition
+                                // Valid topic and partition - write records to disk
+                                if (partition.records) |records| {
+                                    writeRecordsToDisk(topic.name, partition.partition_index, records);
+                                }
+
                                 partition_responses[j] = ProducePartitionResponse{
                                     .partition_index = partition.partition_index,
                                     .error_code = 0,
