@@ -60,17 +60,41 @@ pub const FetchResponse = struct {
     responses: []const FetchTopicResponse,
 };
 
+pub const ProducePartitionResponse = struct {
+    partition_index: i32,
+    error_code: i16,
+    base_offset: i64,
+    log_append_time_ms: i64,
+    log_start_offset: i64,
+};
+
+pub const ProduceTopicResponse = struct {
+    name: []const u8,
+    partitions: []const ProducePartitionResponse,
+};
+
+pub const ProduceResponse = struct {
+    throttle_time_ms: i32,
+    topics: []const ProduceTopicResponse,
+};
+
 pub const BrokerResponse = struct {
     header: ResponseHeader,
     body: union(enum) {
         api_versions: ApiVersionsResponse,
         describe_topic_partitions: DescribeTopicPartitionsResponse,
         fetch: FetchResponse,
+        produce: ProduceResponse,
     },
 };
 
 
 const supported_api_keys = [_]ApiKeyEntry{
+    ApiKeyEntry{
+        .api_key = 0, // Produce
+        .min_version = 0,
+        .max_version = 11,
+    },
     ApiKeyEntry{
         .api_key = 1, // Fetch
         .min_version = 0,
@@ -111,6 +135,90 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
     };
 
     switch (request.headers.api_key) {
+        0 => {
+            // Produce
+            const body = request.body;
+            var produce_responses: []ProduceTopicResponse = &[_]ProduceTopicResponse{};
+
+            if (body == .produce) {
+                const topics = body.produce.topics;
+                var responses = try allocator.alloc(ProduceTopicResponse, topics.len);
+
+                // Load cluster metadata to validate topics and partitions
+                const metadata = try clusterMetadata.parseClusterMetadata(
+                    allocator,
+                    "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log",
+                );
+
+                for (topics, 0..) |topic, i| {
+                    var partition_responses = try allocator.alloc(ProducePartitionResponse, topic.partitions.len);
+
+                    // Check if topic exists
+                    if (metadata.findTopic(topic.name)) |topic_meta| {
+                        // Topic exists - check partitions
+                        const partition_metadata = try metadata.findPartitionsForTopic(allocator, topic_meta.topic_id);
+
+                        for (topic.partitions, 0..) |partition, j| {
+                            // Check if partition exists
+                            var partition_exists = false;
+                            for (partition_metadata) |pm| {
+                                if (pm.partition_index == partition.partition_index) {
+                                    partition_exists = true;
+                                    break;
+                                }
+                            }
+
+                            if (partition_exists) {
+                                // Valid topic and partition
+                                partition_responses[j] = ProducePartitionResponse{
+                                    .partition_index = partition.partition_index,
+                                    .error_code = 0,
+                                    .base_offset = 0,
+                                    .log_append_time_ms = -1,
+                                    .log_start_offset = 0,
+                                };
+                            } else {
+                                // Invalid partition
+                                partition_responses[j] = ProducePartitionResponse{
+                                    .partition_index = partition.partition_index,
+                                    .error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
+                                    .base_offset = -1,
+                                    .log_append_time_ms = -1,
+                                    .log_start_offset = -1,
+                                };
+                            }
+                        }
+                    } else {
+                        // Topic does not exist
+                        for (topic.partitions, 0..) |partition, j| {
+                            partition_responses[j] = ProducePartitionResponse{
+                                .partition_index = partition.partition_index,
+                                .error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
+                                .base_offset = -1,
+                                .log_append_time_ms = -1,
+                                .log_start_offset = -1,
+                            };
+                        }
+                    }
+
+                    responses[i] = ProduceTopicResponse{
+                        .name = topic.name,
+                        .partitions = partition_responses,
+                    };
+                }
+                produce_responses = responses;
+            }
+
+            return BrokerResponse{
+                .header = header,
+                .body = .{
+                    .produce = ProduceResponse{
+                        .throttle_time_ms = 0,
+                        .topics = produce_responses,
+                    },
+                },
+            };
+        },
         1 => {
             // Fetch
             const body = request.body;
@@ -464,6 +572,54 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
             // TAG_BUFFER
             try fbs.writeByte(0);
         },
+        .produce => |produce| {
+            // topics array (COMPACT_ARRAY: length + 1)
+            try fbs.writeByte(@intCast(produce.topics.len + 1));
+
+            for (produce.topics) |topic_response| {
+                // name (COMPACT_STRING: length + 1, then bytes)
+                try fbs.writeByte(@intCast(topic_response.name.len + 1));
+                try fbs.writeAll(topic_response.name);
+
+                // partitions array (COMPACT_ARRAY: length + 1)
+                try fbs.writeByte(@intCast(topic_response.partitions.len + 1));
+
+                for (topic_response.partitions) |partition| {
+                    // partition_index (INT32)
+                    try fbs.writeInt(i32, partition.partition_index, .big);
+
+                    // error_code (INT16)
+                    try fbs.writeInt(i16, partition.error_code, .big);
+
+                    // base_offset (INT64)
+                    try fbs.writeInt(i64, partition.base_offset, .big);
+
+                    // log_append_time_ms (INT64)
+                    try fbs.writeInt(i64, partition.log_append_time_ms, .big);
+
+                    // log_start_offset (INT64)
+                    try fbs.writeInt(i64, partition.log_start_offset, .big);
+
+                    // record_errors (COMPACT_ARRAY: empty = 1)
+                    try fbs.writeByte(1);
+
+                    // error_message (COMPACT_NULLABLE_STRING: null = 0)
+                    try fbs.writeByte(0);
+
+                    // TAG_BUFFER for partition
+                    try fbs.writeByte(0);
+                }
+
+                // TAG_BUFFER for topic
+                try fbs.writeByte(0);
+            }
+
+            // throttle_time_ms (INT32)
+            try fbs.writeInt(i32, produce.throttle_time_ms, .big);
+
+            // TAG_BUFFER
+            try fbs.writeByte(0);
+        },
     }
 
     const written = fbs.buffered();
@@ -474,7 +630,7 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
 
 pub fn writeResponse(allocator: std.mem.Allocator, writer: *std.Io.Writer, request: brokerRequest.BrokerRequest) !void {
     const response = try createResponse(allocator, request);
-    // Use header v1 for flexible APIs (Fetch v12+, DescribeTopicPartitions)
-    const use_header_v1 = (request.headers.api_key == 1) or (request.headers.api_key == 75);
+    // Use header v1 for flexible APIs (Produce v9+, Fetch v12+, DescribeTopicPartitions)
+    const use_header_v1 = (request.headers.api_key == 0) or (request.headers.api_key == 1) or (request.headers.api_key == 75);
     try write(&response, writer, use_header_v1);
 }

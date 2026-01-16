@@ -22,10 +22,24 @@ pub const FetchRequestBody = struct {
     topics: []const FetchTopicRequest,
 };
 
+pub const ProducePartitionRequest = struct {
+    partition_index: i32,
+};
+
+pub const ProduceTopicRequest = struct {
+    name: []const u8,
+    partitions: []const ProducePartitionRequest,
+};
+
+pub const ProduceRequestBody = struct {
+    topics: []const ProduceTopicRequest,
+};
+
 pub const RequestBody = union(enum) {
     none: void,
     describe_topic_partitions: DescribeTopicPartitionsRequestBody,
     fetch: FetchRequestBody,
+    produce: ProduceRequestBody,
 };
 
 pub const BrokerRequest = struct {
@@ -54,6 +68,8 @@ const ParsingState = struct {
         Parsing_topic_tag_buffer,
         // Body states for Fetch (api_key=1)
         Parsing_fetch_body,
+        // Body states for Produce (api_key=0)
+        Parsing_produce_body,
         // Terminal state
         Done,
     };
@@ -70,6 +86,8 @@ const ParsingState = struct {
                     self.state = .Parsing_topics_array_length;
                 } else if (api_key == 1) {
                     self.state = .Parsing_fetch_body;
+                } else if (api_key == 0) {
+                    self.state = .Parsing_produce_body;
                 } else {
                     self.state = .Done;
                 }
@@ -86,6 +104,7 @@ const ParsingState = struct {
                 }
             },
             .Parsing_fetch_body => self.state = .Done,
+            .Parsing_produce_body => self.state = .Done,
             .Done => {},
         }
     }
@@ -114,6 +133,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
     var topic_names: ?[][]u8 = null;
     var current_topic_name_len: usize = 0;
     var fetch_topics: ?[]FetchTopicRequest = null;
+    var produce_topics: ?[]ProduceTopicRequest = null;
 
     var buffer = std.ArrayList(u8){};
     errdefer buffer.deinit(allocator);
@@ -283,6 +303,105 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
                     parsing_state.next(broker_request.headers.api_key);
                 },
 
+                // === BODY PARSING (Produce) ===
+                .Parsing_produce_body => {
+                    // Parse Produce v11 request body
+                    // Skip: transactional_id (COMPACT_NULLABLE_STRING) + acks (INT16) + timeout_ms (INT32)
+                    const remaining = buffer.items[consumed..];
+                    if (remaining.len < 1) break;
+
+                    var pos: usize = 0;
+
+                    // transactional_id (COMPACT_NULLABLE_STRING): 0 means null
+                    const trans_id_len = remaining[pos];
+                    pos += 1;
+                    if (trans_id_len > 1) {
+                        pos += trans_id_len - 1;
+                    }
+
+                    // acks (INT16)
+                    if (pos + 2 > remaining.len) break;
+                    pos += 2;
+
+                    // timeout_ms (INT32)
+                    if (pos + 4 > remaining.len) break;
+                    pos += 4;
+
+                    // topics array (COMPACT_ARRAY)
+                    if (pos >= remaining.len) break;
+                    const topics_len_byte = remaining[pos];
+                    pos += 1;
+                    const topics_count: usize = if (topics_len_byte > 0) topics_len_byte - 1 else 0;
+
+                    if (topics_count > 0) {
+                        produce_topics = try allocator.alloc(ProduceTopicRequest, topics_count);
+
+                        for (0..topics_count) |topic_idx| {
+                            // topic name (COMPACT_STRING)
+                            if (pos >= remaining.len) break;
+                            const name_len_byte = remaining[pos];
+                            pos += 1;
+                            const name_len: usize = if (name_len_byte > 0) name_len_byte - 1 else 0;
+
+                            if (pos + name_len > remaining.len) break;
+                            const name = try allocator.alloc(u8, name_len);
+                            @memcpy(name, remaining[pos .. pos + name_len]);
+                            pos += name_len;
+
+                            // partitions array (COMPACT_ARRAY)
+                            if (pos >= remaining.len) break;
+                            const partitions_len_byte = remaining[pos];
+                            pos += 1;
+                            const partitions_count: usize = if (partitions_len_byte > 0) partitions_len_byte - 1 else 0;
+
+                            var partitions = try allocator.alloc(ProducePartitionRequest, partitions_count);
+
+                            for (0..partitions_count) |part_idx| {
+                                // partition index (INT32)
+                                if (pos + 4 > remaining.len) break;
+                                const partition_index = std.mem.readInt(i32, remaining[pos..][0..4], .big);
+                                pos += 4;
+
+                                // records (COMPACT_BYTES) - skip
+                                if (pos >= remaining.len) break;
+                                // Read unsigned varint for records length
+                                var records_len: u64 = 0;
+                                var shift: u6 = 0;
+                                while (pos < remaining.len) {
+                                    const b = remaining[pos];
+                                    pos += 1;
+                                    records_len |= @as(u64, b & 0x7F) << shift;
+                                    if ((b & 0x80) == 0) break;
+                                    shift += 7;
+                                }
+                                if (records_len > 0) {
+                                    pos += @intCast(records_len - 1); // -1 because COMPACT encoding
+                                }
+
+                                // Skip partition TAG_BUFFER
+                                if (pos < remaining.len) pos += 1;
+
+                                partitions[part_idx] = ProducePartitionRequest{
+                                    .partition_index = partition_index,
+                                };
+                            }
+
+                            // Skip topic TAG_BUFFER
+                            if (pos < remaining.len) pos += 1;
+
+                            produce_topics.?[topic_idx] = ProduceTopicRequest{
+                                .name = name,
+                                .partitions = partitions,
+                            };
+                        }
+                    } else {
+                        produce_topics = try allocator.alloc(ProduceTopicRequest, 0);
+                    }
+
+                    consumed += pos;
+                    parsing_state.next(broker_request.headers.api_key);
+                },
+
                 .Done => break,
             }
         }
@@ -305,6 +424,15 @@ pub fn parseRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Broke
     if (fetch_topics) |topics| {
         broker_request.body = .{
             .fetch = .{
+                .topics = topics,
+            },
+        };
+    }
+
+    // Set the body if we parsed produce topics
+    if (produce_topics) |topics| {
+        broker_request.body = .{
+            .produce = .{
                 .topics = topics,
             },
         };
