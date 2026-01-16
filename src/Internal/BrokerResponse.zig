@@ -45,6 +45,7 @@ pub const DescribeTopicPartitionsResponse = struct {
 pub const FetchPartitionResponse = struct {
     partition_index: i32,
     error_code: i16,
+    records: ?[]const u8, // Raw record batch data from log file
 };
 
 pub const FetchTopicResponse = struct {
@@ -87,6 +88,23 @@ const supported_api_keys = [_]ApiKeyEntry{
     },
 };
 
+fn readLogFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch {
+        return null;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 1024 * 1024) catch {
+        return null;
+    };
+
+    if (data.len == 0) {
+        return null;
+    }
+
+    return data;
+}
+
 fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerRequest) !BrokerResponse {
     const header = ResponseHeader{
         .correlation_id = request.headers.correlation_id,
@@ -102,18 +120,57 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
                 const topics = body.fetch.topics;
                 var responses = try allocator.alloc(FetchTopicResponse, topics.len);
 
-                for (topics, 0..) |topic, i| {
-                    // For unknown topics, return error code 100 (UNKNOWN_TOPIC_ID)
-                    var partition_responses = try allocator.alloc(FetchPartitionResponse, 1);
-                    partition_responses[0] = FetchPartitionResponse{
-                        .partition_index = 0,
-                        .error_code = 100, // UNKNOWN_TOPIC_ID
-                    };
+                // Load cluster metadata to look up topics by UUID
+                const metadata = try clusterMetadata.parseClusterMetadata(
+                    allocator,
+                    "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log",
+                );
 
-                    responses[i] = FetchTopicResponse{
-                        .topic_id = topic.topic_id,
-                        .partitions = partition_responses,
-                    };
+                for (topics, 0..) |topic, i| {
+                    // Look up the topic by UUID
+                    if (metadata.findTopicById(topic.topic_id)) |topic_meta| {
+                        // Topic exists - read from log file
+                        const partition_count = if (topic.partition_indexes.len > 0) topic.partition_indexes.len else 1;
+                        var partition_responses = try allocator.alloc(FetchPartitionResponse, partition_count);
+
+                        for (0..partition_count) |part_idx| {
+                            const partition_index: i32 = if (topic.partition_indexes.len > 0)
+                                topic.partition_indexes[part_idx]
+                            else
+                                0;
+
+                            // Build log file path: /tmp/kraft-combined-logs/{topic_name}-{partition}/00000000000000000000.log
+                            var path_buf: [256]u8 = undefined;
+                            const log_path = std.fmt.bufPrint(&path_buf, "/tmp/kraft-combined-logs/{s}-{d}/00000000000000000000.log", .{ topic_meta.name, partition_index }) catch "/tmp/kraft-combined-logs/unknown-0/00000000000000000000.log";
+
+                            // Try to read the log file
+                            const records = readLogFile(allocator, log_path);
+
+                            partition_responses[part_idx] = FetchPartitionResponse{
+                                .partition_index = partition_index,
+                                .error_code = 0,
+                                .records = records,
+                            };
+                        }
+
+                        responses[i] = FetchTopicResponse{
+                            .topic_id = topic.topic_id,
+                            .partitions = partition_responses,
+                        };
+                    } else {
+                        // Topic does not exist - return error code 100 (UNKNOWN_TOPIC_ID)
+                        var partition_responses = try allocator.alloc(FetchPartitionResponse, 1);
+                        partition_responses[0] = FetchPartitionResponse{
+                            .partition_index = 0,
+                            .error_code = 100, // UNKNOWN_TOPIC_ID
+                            .records = null,
+                        };
+
+                        responses[i] = FetchTopicResponse{
+                            .topic_id = topic.topic_id,
+                            .partitions = partition_responses,
+                        };
+                    }
                 }
                 fetch_responses = responses;
             }
@@ -238,7 +295,7 @@ fn createResponse(allocator: std.mem.Allocator, request: brokerRequest.BrokerReq
     }
 }
 fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1: bool) !void {
-    var buf: [1024]u8 = undefined;
+    var buf: [1024 * 1024]u8 = undefined; // 1MB buffer for records
     var fbs = std.Io.Writer.fixed(&buf);
 
     // Write correlation_id
@@ -381,8 +438,20 @@ fn write(response: *const BrokerResponse, writer: *std.Io.Writer, use_header_v1:
                     // preferred_read_replica (INT32)
                     try fbs.writeInt(i32, 0, .big);
 
-                    // records (COMPACT_NULLABLE_BYTES: null = 0)
-                    try fbs.writeByte(0);
+                    // records (COMPACT_NULLABLE_BYTES)
+                    if (partition.records) |records| {
+                        // Write length + 1 as unsigned varint
+                        var len_val: u64 = records.len + 1;
+                        while (len_val >= 0x80) {
+                            try fbs.writeByte(@intCast((len_val & 0x7F) | 0x80));
+                            len_val >>= 7;
+                        }
+                        try fbs.writeByte(@intCast(len_val));
+                        try fbs.writeAll(records);
+                    } else {
+                        // null = 0
+                        try fbs.writeByte(0);
+                    }
 
                     // TAG_BUFFER for partition
                     try fbs.writeByte(0);

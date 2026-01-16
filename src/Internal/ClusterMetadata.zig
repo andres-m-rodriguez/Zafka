@@ -27,6 +27,15 @@ pub const ClusterMetadata = struct {
         return null;
     }
 
+    pub fn findTopicById(self: *const ClusterMetadata, topic_id: [16]u8) ?*const TopicMetadata {
+        for (self.topics) |*topic| {
+            if (std.mem.eql(u8, &topic.topic_id, &topic_id)) {
+                return topic;
+            }
+        }
+        return null;
+    }
+
     pub fn findPartitionsForTopic(self: *const ClusterMetadata, allocator: std.mem.Allocator, topic_id: [16]u8) ![]const PartitionMetadata {
         var count: usize = 0;
         for (self.partitions) |partition| {
